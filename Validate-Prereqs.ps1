@@ -390,6 +390,11 @@ function Parse-ConnectivityPrereqs
     }
 }
 
+# Create any appliances needed for validation through PowerCLI
+function Create-ComponentAppliances
+{
+}
+
 # Some settings on the appliance might need to be configured based on the information in the prereq sheet
 # These configurations are made here
 function Prepare-ComponentAppliances
@@ -547,7 +552,7 @@ function Check-ComponentConnectivity
                     {
                         $connection[5] = Check-ConnectionBetween $source_ip $destination_ip $connection[2]
                         # As soon as we get one failure, no need to continue with the rest
-                        # TODO: fix this, we should check connectivity with all IPs
+                        # TODO: fix this, we should check connectivity with all IPs. The result could be an array in this case
                         if ($connection[5] -notmatch "^PASSED")
                         {
                             break
@@ -622,7 +627,7 @@ function Check-ComponentConnectivity
             }
             else
             {
-                $connection[3] = Check-ConnectionBetween $source_ip $destination $connection[2]
+                $connection[5] = Check-ConnectionBetween $source_ip $destination $connection[2]
             }
         }
     }
@@ -644,8 +649,8 @@ function Check-ConnectionBetween([string]$source, $destination, [int]$port)
             $destination = $destination -replace "\*.phobos.apple.com.edgesuite.net","ax.phobos.apple.com.edgesuite.net"
             # Random number for the Apple URL
             $destination = $destination -replace "#","$(Get-Random -Minimum 0 -Maximum 200)"
-            # Any remaining wildcards can just be dropped
-            $destination = $destination -replace "\*.",""
+            # Any remaining wildcards can just be replace with www
+            $destination = $destination -replace "\*","www"
         }
         $result = Test-NetConnection -ComputerName $destination -Port $port
         if ($result.TcpTestSucceeded)
