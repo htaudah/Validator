@@ -1,0 +1,8 @@
+opt
+home
+etc/shadow
+usr/local/etc/ssh
+etc/ssl/keys
+etc/ssl/certs
+usr/local/etc/ssl/openssl.cnf
+var/www
