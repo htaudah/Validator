@@ -28,6 +28,16 @@ to the virtual machine. When prompted, enter the password vmbox.
 
 > ./prepare\_appliance.sh \<APPLIANCE\_IP\>
 
+When appliance preparation is complete, the virtual machine will be shut down to prepare for OVF export.
+
+Before exporting the machine to OVF, you'll need to enable the vApp options that will be used to configure the
+appliance during deployment. You can follow the guide [here]() for information on how to create vApp options. The
+options utilized by the appliance are shown in the table below:
+
+| vApp Option | Description |
+| ----------- | ----------- |
+| 
+
 Install the Posh-SSH and ImportExcel modules before running the tool using the Install-Module commands below:
 #TODO: include modules in validator?
 Install-Module Posh-SSH -Scope CurrentUser
