@@ -34,9 +34,13 @@ Before exporting the machine to OVF, you'll need to enable the vApp options that
 appliance during deployment. You can follow the guide [here]() for information on how to create vApp options. The
 options utilized by the appliance are shown in the table below:
 
-| vApp Option | Description |
-| ----------- | ----------- |
-| 
+| Key | Label | Category |
+| ----------- | ----------- | --- |
+| guestinfo.hostname | Hostname | Networking |
+| guestinfo.ipaddress | IP Address | Networking |
+| guestinfo.netmask | Netmask | Networking |
+| guestinfo.gateway | Gateway | Networking |
+| guestinfo.dns | DNS Server | Networking |
 
 Install the Posh-SSH and ImportExcel modules before running the tool using the Install-Module commands below:
 #TODO: include modules in validator?
