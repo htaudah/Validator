@@ -1,13 +1,32 @@
-﻿param(
+﻿<#
+.SYNOPSIS
+Ensures that environment of the machine running the script is ready for a Workspace ONE deployment.
+.DESCRIPTION
+The Validate-Prerequisites script runs a series of tests for all network requirements listed in the Workspace
+ONE prerequisite sheet.
+.PARAMETER VsphereUsername
+The username used to connect to VSphere (ESXi or VCenter) for running PowerCLI commands
+.PARAMETER VspherePassword
+The password used to connect to Vsphere (ESXi or VCenter) for running PowerCLI commands
+#>
+param(
     [string]$SSH_USERNAME="root",
     [string]$SSH_PASSWORD="vmbox",
-    [string]$SheetPath=".\Pre-Install Requirements 202003 Revised vCM v3.xlsx",
+    [string]$SheetPath=".\Pre-Install_Requirements.xlsx",
     # Set this to an empty string to open the result as an unsaved temp file
     [string]$OutputPath="",
     [string]$SelfSignedThumbprint="THUMPER"
+    [boolean]$AutoCreate=$False
+    [string]$VsphereHost
+    [string]$VsphereUsername
+    [string]$VspherePassword
 )
 
+# TODO: for now we're using a static host for all components to be created
+$vm_host = '192.168.1.208'
+
 $SECURE_SSH_PASSWORD = ConvertTo-SecureString -String $SSH_PASSWORD -AsPlainText -Force
+$Secure_VspherePassword = ConvertTo-SecureString -String $VspherePassword -AsPlainText -Force
 
 # These constants are references to column/section headers; all references in the script should be to these variables
 # and not to the Excel string values (which are apt to change)
@@ -27,6 +46,11 @@ $C_PRESENT = 'Present'
 $C_PORTS = 'Port(s)'
 $C_COMPONENTS_NAME = 'Components'
 $C_DESTINATION_COMPONENT = 'Destination Component'
+$C_DEVICES = 'Devices on Internet or Wi-Fi'
+$C_BROWSER = 'Browser'
+$C_APPLIANCE_AUTO_PREPARATION = 'Appliance Auto-Preparation'
+$C_VCENTER_SERVER = 'vCenter FQDN'
+$C_QUESTIONNAIRE = 'Questionnaire'
 
 # This is a list of URLs with wildcards or other special characters that need to be converted into actual
 # URLs for testing. These are only used when for URLs for which the default method of swapping the *
@@ -57,15 +81,25 @@ $prereq_table = @{
 
 # Get workbook information
 $excel_pkg = Open-ExcelPackage -Path $SheetPath
+if ($excel_pkg -eq $null)
+{
+    exit 1
+}
 $worksheets = $excel_pkg.Workbook.Worksheets | ForEach-Object {$_.Name}
+
 
 # This hashtable contains all relevant components in the Workspace ONE architecture
 # It is pre-loaded with some pseudo-components that are not associated with any particular
 # physical device (e.g. 'Devices on Wi-Fi or Internet')
 $components = @{}
-$components['Devices on Internet or Wi-Fi'] = [PSCustomObject]@{
+# These are the components that are actually represented by the machine running the test.
+$local_components = @($C_DEVICES, $C_BROWSER)
+foreach ($local_component in $local_components)
+{
+    $components[$local_component] = [PSCustomObject]@{
         IPs = 'localhost'
     }
+}
 
 # These are the resources that are present in the Internal Resources section
 $resources = @{}
@@ -77,6 +111,10 @@ function Write-Failure($message)
 function Write-Success($message)
 {
     Write-Host -ForegroundColor Green $message
+}
+function Write-Log($message)
+{
+    Write-Host -ForegroundColor Yellow $message
 }
 # TODO: is this regex good enough?
 function is_url($url)
@@ -99,6 +137,7 @@ function Parse-PrereqComponents
     $components_index = -1
     $resources_index = -1
     $accounts_index = -1
+    $questionnaire_index = -1
     for ($i = 0; $i -lt 1000; $i += 1)
     {
         $cell_index = "B" + $i
@@ -116,10 +155,14 @@ function Parse-PrereqComponents
         {
             $accounts_index = $i + 1
         }
-
-        if ($accounts_index -gt 0)
+        elseif ($cell.Text -eq $C_QUESTIONNAIRE)
         {
-            # account section should be the last one
+            $questionnaire_index = $i + 1
+        }
+
+        if ($questionnaire_index -gt 0)
+        {
+            # questionnaire section should be the last one
             break
         }
     }
@@ -144,6 +187,10 @@ function Parse-PrereqComponents
         {
             Write-Error "Parse error for component $($component_name): There was mismatch in the number of Server"`
                 + "IPs and Hostnames ($($server_ip_lines.Count) Server IP lines; $($name_lines.Count) Hostname lines)"
+        }
+        # If using auto-create, check if additional columns have been included
+        if ()
+        {
         }
         # Not all components have a VIP
         if ($datarow.$C_DNS_RECORD -ne $null)
@@ -221,8 +268,7 @@ function Parse-ConnectivityPrereqs
     {
         #TODO: remove this when done testing
         if ($worksheet -ne 'Access (On-Premises)' -and $worksheet -ne 'DS-AWCM-API (On-Premises)') {continue}
-        #if ($worksheet -ne 'Devices on Internet or Wi-Fi') {continue}
-        echo $worksheet
+        Write-Log $worksheet
         
         # Find correct ranges for all the information
         $cells = $excel_pkg.$worksheet.Cells
@@ -387,65 +433,6 @@ function Parse-ConnectivityPrereqs
             }
         }
         # if not found, then this sheet has no info pertaining to connectivity requirements
-    }
-}
-
-# Create any appliances needed for validation through PowerCLI
-function Create-ComponentAppliances
-{
-}
-
-# Some settings on the appliance might need to be configured based on the information in the prereq sheet
-# These configurations are made here
-function Prepare-ComponentAppliances
-{
-    # Look for destination components that will need to listen for HTTP traffic
-    # and compile the lists of port numbers for each host
-    $appliance_ports = @{}
-    foreach ($connection in $prereq_table.CONNECTIVITY)
-    {
-        $destination = $connection[1]
-        # If it's not a component, there's no appliance for it and we don't care
-        if ($destination.GetType() -ne 'PSCustomType')
-        {
-            continue
-        }
-        # reminder: connection[2] is the protocol
-        if ($connection[2] -match "HTTP")
-        {
-            foreach ($host_ip in $destination.IPs)
-            {
-                if ($appliance_ports[$host_ip] -eq $null)
-                {
-                    $appliance_ports[$host_ip] = @()
-                }
-                $appliance_ports[$host_ip] += @($connection[2], $connection[3])
-            }
-        }
-    }
-    # Now we can start lighttpd on all appliances once the configurations are final
-    foreach ($host_ip in $appliance_ports.Keys)
-    {
-        # all ports for this appliance
-        $key_appliance_ports = $appliance_ports[$key]
-        # Connect to appliance and edit lighttpd configuration to specified port
-        $cred = New-Object -TypeName System.Management.Automation.PSCredential -ArgumentList $SSH_USERNAME, $SECURE_SSH_PASSWORD
-        try {
-            $session = New-SSHSession -ComputerName $host_ip -AcceptKey -Credential $cred -ErrorAction Stop
-        }
-        catch {
-            Write-Failure "ERROR: An SSH session could not be established to prepare component `'$component`'. "`
-                + "The error details are printed below:`n"`
-                + $_.Exception.Message;
-        }
-        $ssl_state = if ($key_applicance_ports[1] -match "HTTPS") {"enabled"} else {"disabled"}
-        # clear out any previous configuration that might be there and kill the process if it's running
-        Invoke-SSHCommand -SSHSession $session -Command "sudo sed '/SERVER[/d' /var/www/lighttpd.conf"
-        Invoke-SSHCommand -SSHSession $session -Command "sudo kill ``cat /var/www/server.pid-file``"
-        # and set the new port/ssl configurations
-        Invoke-SSHCommand -SSHSession $session -Command "sudo echo $SERVER[`"socket`"] == `":$key_appliance_ports[0]`" {ssl.engine = `"$ssl_state`"}"
-        Invoke-SSHCommand -SSHSession $session -Command "sudo /usr/local/sbin/lighttpd -f /var/www/lighttpd.conf"
-        Remove-SSHSession $session
     }
 }
 
@@ -760,6 +747,103 @@ function Print-Results
     Export-Excel -ExcelPackage $result_excel -Show
 }
 
+# Load Lam's OVF props functions
+. $PSScriptRoot\VMOvfProperty.ps1
+
+# Create any appliances needed for validation through PowerCLI
+function Create-ComponentAppliances
+{
+    $cred = New-Object -TypeName System.Management.Automation.PSCredential -ArgumentList $VsphereUsername, $Secure_VspherePassword
+    $vi_server = Connect-VIServer -Server $VsphereHost -Credential $cred
+    $tc_template = Get-Template -Name 'TinyCore' -Server $vi_server
+    # If template was not added yet, components cannot be created
+    if ($tc_template -eq $null)
+    {
+        Write-Failure "Could not locate 'TinyCore' appliance on specified VSphere host $VsphereHost"
+        return 1
+    }
+    # Keep track of DNS VIPs created to avoid duplicates for alias components
+    $processed_components = @()
+    # Create all components parsed from the first sheet
+    foreach ($component_name in $components.Keys)
+    {
+        $component = $components[$component_name]
+        # Skip components that were already processed (through an alias) as well as local components
+        if ($local_components -contains $component_name -or $processed_components -contains $component.DNSIP)
+        {
+            continue
+        }
+        # We'll need to create a separate appliance for each server belonging to the component
+        foreach ($i in 0..$component.Hostnames)
+        {
+            $vm = New-VM -Template $tc_template -Name ('TinyCore_' + $component_name) -VMHost $vm_host
+            # Set the OVF props according to component properties
+            $vm_props = @{
+                'guestinfo.hostname' = $component.Hostnames[$i]
+                'guestinfo.ipaddress' = $component.IPs[$i]
+                'guestinfo.netmask' = $component.Subnets[$i]
+                'guestinfo.gateway' = $component.Gateways[$i]
+                'guestinfo.dns' = $component.DNSRecord
+            }
+        }
+    }
+}
+
+# Some settings on the appliance might need to be configured based on the information in the prereq sheet
+# These configurations are made here
+function Prepare-ComponentAppliances
+{
+    # Look for destination components that will need to listen for HTTP traffic
+    # and compile the lists of port numbers for each host
+    $appliance_ports = @{}
+    foreach ($connection in $prereq_table.CONNECTIVITY)
+    {
+        $destination = $connection[1]
+        # If it's not a component, there's no appliance for it and we don't care
+        if ($destination.GetType() -ne 'PSCustomType')
+        {
+            continue
+        }
+        # reminder: connection[2] is the protocol
+        if ($connection[2] -match "HTTP")
+        {
+            foreach ($host_ip in $destination.IPs)
+            {
+                if ($appliance_ports[$host_ip] -eq $null)
+                {
+                    $appliance_ports[$host_ip] = @()
+                }
+                $appliance_ports[$host_ip] += @($connection[2], $connection[3])
+            }
+        }
+    }
+    # Now we can start lighttpd on all appliances once the configurations are final
+    foreach ($host_ip in $appliance_ports.Keys)
+    {
+        # all ports for this appliance
+        $key_appliance_ports = $appliance_ports[$key]
+        # Connect to appliance and edit lighttpd configuration to specified port
+        $cred = New-Object -TypeName System.Management.Automation.PSCredential -ArgumentList $SSH_USERNAME, $SECURE_SSH_PASSWORD
+        try {
+            $session = New-SSHSession -ComputerName $host_ip -AcceptKey -Credential $cred -ErrorAction Stop
+        }
+        catch {
+            Write-Failure "ERROR: An SSH session could not be established to prepare component `'$component`'. "`
+                + "The error details are printed below:`n"`
+                + $_.Exception.Message;
+        }
+        $ssl_state = if ($key_applicance_ports[1] -match "HTTPS") {"enabled"} else {"disabled"}
+        # clear out any previous configuration that might be there and kill the process if it's running
+        Invoke-SSHCommand -SSHSession $session -Command "sudo sed '/SERVER[/d' /var/www/lighttpd.conf"
+        Invoke-SSHCommand -SSHSession $session -Command "sudo kill ``cat /var/www/server.pid-file``"
+        # and set the new port/ssl configurations
+        Invoke-SSHCommand -SSHSession $session -Command "sudo echo $SERVER[`"socket`"] == `":$key_appliance_ports[0]`" {ssl.engine = `"$ssl_state`"}"
+        Invoke-SSHCommand -SSHSession $session -Command "sudo /usr/local/sbin/lighttpd -f /var/www/lighttpd.conf"
+        Remove-SSHSession $session
+    }
+}
+
 Parse-PrereqComponents
 Parse-ConnectivityPrereqs
 #Check-DNSPrereqs
+echo "Done"
