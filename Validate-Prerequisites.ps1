@@ -4,10 +4,16 @@ Ensures that environment of the machine running the script is ready for a Worksp
 .DESCRIPTION
 The Validate-Prerequisites script runs a series of tests for all network requirements listed in the Workspace
 ONE prerequisite sheet.
-.PARAMETER VsphereUsername
-The username used to connect to VSphere (ESXi or VCenter) for running PowerCLI commands
-.PARAMETER VspherePassword
-The password used to connect to Vsphere (ESXi or VCenter) for running PowerCLI commands
+.PARAMETER VsphereCredentials
+The PSCredential used to connect to VSphere (ESXi or VCenter) for running PowerCLI commands
+.PARAMETER SSH_USERNAME
+The username used to connect to the validation appliances through SSH
+.PARAMETER SSH_PASSWORD
+The password used to connect to the validation appliances through SSH
+.PARAMETER SheetPath
+The full path of the prerequisite excel sheet
+.PARAMETER SelfSignedThumbprint
+The thumbprint of the SSL certificate embedded into the validation appliances
 #>
 param(
     [string]$SSH_USERNAME="root",
@@ -15,18 +21,12 @@ param(
     [string]$SheetPath=".\Pre-Install_Requirements.xlsx",
     # Set this to an empty string to open the result as an unsaved temp file
     [string]$OutputPath="",
-    [string]$SelfSignedThumbprint="THUMPER"
-    [boolean]$AutoCreate=$False
-    [string]$VsphereHost
-    [string]$VsphereUsername
-    [string]$VspherePassword
+    [string]$SelfSignedThumbprint="THUMPER",
+    [string]$VsphereFQDN="vsphere.haramco.xyz",
+    [PSCredential]$VsphereCredentials
 )
 
-# TODO: for now we're using a static host for all components to be created
-$vm_host = '192.168.1.208'
-
 $SECURE_SSH_PASSWORD = ConvertTo-SecureString -String $SSH_PASSWORD -AsPlainText -Force
-$Secure_VspherePassword = ConvertTo-SecureString -String $VspherePassword -AsPlainText -Force
 
 # These constants are references to column/section headers; all references in the script should be to these variables
 # and not to the Excel string values (which are apt to change)
@@ -34,23 +34,33 @@ $C_ENVIRONMENT_HEADER = 'Environment'
 $C_COMPONENTS_HEADER = 'Final Workspace ONE Components'
 $C_ACCOUNTS_HEADER = 'Service Accounts'
 $C_REQUIRED = 'Required'
+$C_COMPONENTS = 'Components'
 $C_HOSTNAMES = 'Server Hostname(s)'
 $C_SERVER_IPS = 'Server IP(s)'
 $C_DNS_RECORD = 'DNS (VIP) Record'
 $C_DNS_IP = 'IP of DNS (VIP) Record'
+$C_SSL_HANDLING = 'SSL Handling'
 $C_RESOURCES_HEADER = 'Internal Resources'
 $C_SERVER_SHEET = 'Servers & Environment'
 $C_NETWORK_REQUIREMENTS = 'Network Requirements'
 $C_ADDITIONAL_COMPONENTS = 'Additional Components'
 $C_PRESENT = 'Present'
 $C_PORTS = 'Port(s)'
-$C_COMPONENTS_NAME = 'Components'
 $C_DESTINATION_COMPONENT = 'Destination Component'
 $C_DEVICES = 'Devices on Internet or Wi-Fi'
 $C_BROWSER = 'Browser'
 $C_APPLIANCE_AUTO_PREPARATION = 'Appliance Auto-Preparation'
 $C_VCENTER_SERVER = 'vCenter FQDN'
 $C_QUESTIONNAIRE = 'Questionnaire'
+$C_COMPUTE_NODE = 'Compute Node'
+$C_GATEWAY_IP = 'Gateway IP Address'
+$C_SUBNET_MASK = 'Subnet Mask'
+$C_QUESTION = 'Question'
+$C_ANSWER = 'Answer'
+$C_AUTO_PREPARE = 'Appliance Auto-Preparation'
+$C_VM_NETWORK = 'VM Network'
+$C_DATASTORE = 'Datastore'
+$C_DNS_SERVER = 'DNS Server'
 
 # This is a list of URLs with wildcards or other special characters that need to be converted into actual
 # URLs for testing. These are only used when for URLs for which the default method of swapping the *
@@ -64,6 +74,9 @@ $wildcard_urls = @{
 
 # This will be used to hold the results excel package
 $result_excel = $null
+
+# Questionnaire answers that are relevant to the script
+$auto_prepare = $null
 
 # This table will be used to store the results of all prereq checks for the final report
 # The table is represented as follows:
@@ -138,12 +151,18 @@ function Parse-PrereqComponents
     $resources_index = -1
     $accounts_index = -1
     $questionnaire_index = -1
+    # the environment index is only needed for the Auto-Prepare fields
+    $environment_index = -1
     for ($i = 0; $i -lt 1000; $i += 1)
     {
         $cell_index = "B" + $i
         $cell = $cells[$cell_index]
 
-        if ($cell.Text -eq $C_COMPONENTS_HEADER)
+        if ($cell.Text -eq $C_ENVIRONMENT_HEADER)
+        {
+            $environment_index = $i + 1
+        }
+        elseif ($cell.Text -eq $C_COMPONENTS_HEADER)
         {
             $components_index = $i + 1
         }
@@ -159,21 +178,40 @@ function Parse-PrereqComponents
         {
             $questionnaire_index = $i + 1
         }
+        # if started reading the questionnaire, parsing stops at the first blank cell
+        elseif ($questionnaire_index -gt 0)
+        {
+            if ($cell.Text.Length -eq 0)
+            {
+                $questionnaire_index_end = $i
+            }
+        }
 
-        if ($questionnaire_index -gt 0)
+        if ($questionnaire_index_end -gt 0)
         {
             # questionnaire section should be the last one
             break
         }
     }
 
-    # First read the components
+    # First read the questionnaire answers
+    $data = Import-Excel -Path $SheetPath -WorkSheetname $C_SERVER_SHEET -StartRow $questionnaire_index -EndRow $questionnaire_index_end
+
+    foreach ($datarow in $data)
+    {
+        if ($datarow.$C_QUESTION -eq $C_AUTO_PREPARE)
+        {
+            $auto_prepare = $datarow.$C_ANSWER
+        }
+    }
+
+    # Now read the components
     $data = Import-Excel -Path $SheetPath -WorkSheetname $C_SERVER_SHEET -StartRow $components_index -EndRow ($accounts_index - 3)
 
     $i = 0
     foreach ($datarow in $data)
     {
-        $component_name = $datarow.Components
+        $component_name = $datarow.$C_COMPONENTS
         # There is no longer a Required column since we're using the Final Components table. Instead, we skip components
         # that have neither a hostname nor a DNS entry
         if ($datarow.$C_HOSTNAMES -eq "N/A" -and $datarow.$C_DNS_RECORD -eq "N/A")
@@ -185,12 +223,8 @@ function Parse-PrereqComponents
         $server_ip_lines = $datarow.$C_SERVER_IPS.Split("`n")
         if ($name_lines.Count -ne $server_ip_lines.Count)
         {
-            Write-Error "Parse error for component $($component_name): There was mismatch in the number of Server"`
+            Write-Failure "Parse error for component $($component_name): There was a mismatch in the number of Server"`
                 + "IPs and Hostnames ($($server_ip_lines.Count) Server IP lines; $($name_lines.Count) Hostname lines)"
-        }
-        # If using auto-create, check if additional columns have been included
-        if ()
-        {
         }
         # Not all components have a VIP
         if ($datarow.$C_DNS_RECORD -ne $null)
@@ -200,11 +234,11 @@ function Parse-PrereqComponents
         }
         if ($vip_lines.Count -gt 1)
         {
-            Write-Error "Parse error for component $($component_name): More than one DNS record listed"
+            Write-Failure "Parse error for component $($component_name): More than one DNS record listed"
         }
         if ($vip_ip_lines.Count -gt 1)
         {
-            Write-Error "Parse error for component $($component_name): More than one DNS IP listed"
+            Write-Failure "Parse error for component $($component_name): More than one DNS IP listed"
         }
         # if a component has the same DNS record as a previous component, it is simply an alias to that component
         if ($vip_lines -ne $null)
@@ -218,17 +252,78 @@ function Parse-PrereqComponents
                 }
             }
         }
-        
+
         $components[$component_name] = [PSCustomObject]@{
             DNSRecord = if ($vip_lines -ne $null) {$vip_lines[0].Trim()} else {$null}
             DNSIP = if ($vip_ip_lines -ne $null) {$vip_ip_lines[0].Trim()} else {$null}
             Hostnames = @($name_lines | ForEach-Object {$_.Trim()})
             IPs = @($server_ip_lines | ForEach-Object {$_.Trim()})
-            SSLHandling = $datarow.'SSL Handling'
+            SSLHandling = $datarow.$C_SSL_HANDLING
+            ### Remaining fields only needed if using auto-prepare
+            ComputeNodes = $null
+            GatewayIPs = $null
+            SubnetMasks = $null
+            VMNetworks = $null
+            Datastores = $null
         }
 
         $i+=1
     }
+
+    # Now read the environments section if using auto-prepare
+    if ($auto_prepare)
+    {
+        $data = Import-Excel -Path $SheetPath -WorkSheetname $C_SERVER_SHEET -StartRow $environment_index -EndRow ($resources_index - 3)
+        foreach ($datarow in $data)
+        {
+            $component = $components[$datarow.$C_COMPONENTS]
+            # We only care about components that were seen in the resources table
+            # We also don't care about alias components (a single validation appliance will suffice)
+            if ($component -eq $null -or $component.$C_HOSTNAMES -eq "N/A" -or $datarow.$C_REQUIRED -match "Same as")
+            {
+                continue
+            }
+            $component_name = $datarow.$C_COMPONENTS
+            # If using auto-create, check if additional columns have been included
+            $required_params = @($C_COMPUTE_NODE, $C_GATEWAY_IP, $C_SUBNET_MASK, $C_VM_NETWORK, $C_DATASTORE)
+            foreach ($required_param in $required_params)
+            {
+                if ($datarow.$required_param -eq $null)
+                {
+                    Write-Failure $("Parse error for component $($component_name): $C_AUTO_PREPARE was selected but no "`
+                        + "value for `"$required_param`" was provided")
+                    exit 1
+                }
+            }
+            $subnets = $datarow.$C_SUBNET_MASK.Split("`n")
+            $gateway_ips = $datarow.$C_GATEWAY_IP.Split("`n")
+            $compute_nodes = $datarow.$C_COMPUTE_NODE.Split("`n")
+            $vm_networks = $datarow.$C_VM_NETWORK.Split("`n")
+            $datastores = $datarow.$C_DATASTORE.Split("`n")
+
+            if ($subnets.Count -ne $component.Hostnames.Count)
+            {
+                Write-Failure $("Parse error for component $($component_name): There was a mismatch in the number of Hostname"`
+                    + "and $C_SUBNET_MASK lines ($($subnets.Count) $C_SUBNET_MASK lines; $($component.Hostnames.Count) Hostname lines)")
+            }
+            if ($compute_nodes.Count -ne $component.Hostnames.Count)
+            {
+                Write-Failure $("Parse error for component $($component_name): There was a mismatch in the number of Hostname"`
+                    + "and $C_COMPUTE_NODE lines ($($compute_nodes.Count) $C_COMPUTE_NODE lines; $($component.Hostnames.Count) Hostname lines)")
+            }
+            if ($gateway_ips.Count -ne $component.Hostnames.Count)
+            {
+                Write-Failure $("Parse error for component $($component_name): There was a mismatch in the number of Hostname"`
+                    + "and $C_GATEWAY_IP lines ($($gateway_ips.Count) $C_GATEWAY_IP lines; $($component.Hostnames.Count) Hostname lines)")
+            }
+            $component.ComputeNodes = $compute_nodes
+            $component.GatewayIPs = $gateway_ips
+            $component.SubnetMasks = $subnets
+            $component.VMNetworks = $vm_networks
+            $component.Datastores = $datastores
+        }
+    }
+        
 
     # Now read the resources section
     $data = Import-Excel -Path $SheetPath -WorkSheetname $C_SERVER_SHEET -StartRow $resources_index -EndRow ($components_index - 3)
@@ -241,20 +336,21 @@ function Parse-PrereqComponents
             continue
         }
 
-        $resource_name = $datarow.$C_COMPONENTS_NAME
+        $resource_name = $datarow.$C_COMPONENTS
 
         $name_lines = $datarow.$C_HOSTNAMES.Split("`n")
         $server_ip_lines = $datarow.$C_SERVER_IPS.Split("`n")
-        if ($name_lines.Count -ne 1)
+        # TODO: for now only the DNS server can have multiple hostnames
+        if ($name_lines.Count -ne 1 -and $resource_name -ne $C_DNS_SERVER)
         {
             Write-Error "Parse error for resource $($resource_name): expected one Hostname line"
         }
-        if ($vip_ip_lines.Count -ne 1)
+        if ($vip_ip_lines.Count -ne 1 -and $resource_name -ne $C_DNS_SERVER)
         {
             Write-Error "Parse error for resource $($resource_name): expected one Server IP line"
         }
 
-        $resources[$datarow.$C_COMPONENTS_NAME] = [PSCustomObject]@{
+        $resources[$resource_name] = [PSCustomObject]@{
             Hostnames = $datarow.$C_HOSTNAMES
             IPs = $datarow.$C_SERVER_IPS
         }
@@ -751,16 +847,30 @@ function Print-Results
 . $PSScriptRoot\VMOvfProperty.ps1
 
 # Create any appliances needed for validation through PowerCLI
+# NOTE: any error here renders the validation useless, so we exit early
 function Create-ComponentAppliances
 {
-    $cred = New-Object -TypeName System.Management.Automation.PSCredential -ArgumentList $VsphereUsername, $Secure_VspherePassword
-    $vi_server = Connect-VIServer -Server $VsphereHost -Credential $cred
+    if (-Not ($VsphereFQDN.Length -gt 0))
+    {
+        Write-Failure "$C_AUTO_PREPARE was specified but VsphereFQDN parameter was blank"
+        exit 1
+    }
+    if ($VsphereCredentials -eq $null)
+    {
+        $cred = Get-Credential -Message "$C_AUTO_PREPARE was specified but VSphere credentials were not provided. Enter VSphere credentials."
+    }
+    else
+    {
+        $cred = $VsphereCredentials
+    }
+    $vi_server = Connect-VIServer -Server $VsphereFQDN -Credential $cred
     $tc_template = Get-Template -Name 'TinyCore' -Server $vi_server
     # If template was not added yet, components cannot be created
     if ($tc_template -eq $null)
     {
-        Write-Failure "Could not locate 'TinyCore' appliance on specified VSphere host $VsphereHost"
-        return 1
+        Write-Failure "Could not locate 'TinyCore' appliance on specified VSphere host $VsphereFQDN"
+        Disconnect-VIServer -Confirm:$False
+        exit 1
     }
     # Keep track of DNS VIPs created to avoid duplicates for alias components
     $processed_components = @()
@@ -768,25 +878,40 @@ function Create-ComponentAppliances
     foreach ($component_name in $components.Keys)
     {
         $component = $components[$component_name]
+        # Skip components that don't have auto-prepare fields (these must be aliases)
         # Skip components that were already processed (through an alias) as well as local components
-        if ($local_components -contains $component_name -or $processed_components -contains $component.DNSIP)
+        if ($local_components -contains $component_name -or $component.ComputeNodes -eq $null)
         {
             continue
         }
         # We'll need to create a separate appliance for each server belonging to the component
-        foreach ($i in 0..$component.Hostnames)
+        foreach ($i in 0..$component.Hostnames.Count)
         {
-            $vm = New-VM -Template $tc_template -Name ('TinyCore_' + $component_name) -VMHost $vm_host
+            $vm = Get-VM -Name ("TinyCore_$($component_name)_$i") -ErrorAction Ignore
+            if ($vm -ne $null)
+            {
+                Write-Failure "$C_AUTO_PREPARE was selected but a previous validation appliance with name `"$("TinyCore_$($component_name)_$i")`" was found."
+                Disconnect-VIServer -Confirm:$False
+                exit 1
+            }
+            $vm = New-VM -Template $tc_template -Name ("TinyCore_$($component_name)_$i") -VMHost $component.ComputeNodes[$i]`
+                -Datastore $component.Datastores[$i] -PortGroup (Get-VDPortGroup -Name $component.VMNetworks[$i])
             # Set the OVF props according to component properties
             $vm_props = @{
                 'guestinfo.hostname' = $component.Hostnames[$i]
                 'guestinfo.ipaddress' = $component.IPs[$i]
-                'guestinfo.netmask' = $component.Subnets[$i]
-                'guestinfo.gateway' = $component.Gateways[$i]
-                'guestinfo.dns' = $component.DNSRecord
+                'guestinfo.netmask' = $component.SubnetMasks[$i]
+                'guestinfo.gateway' = $component.GatewayIPs[$i]
+                'guestinfo.dns' = $resources[$C_DNS_SERVER].IPs[0]
             }
+            Set-VMOvfProperty -VM $vm $vm_props
+            #Start-VM -VM $vm
+            # TODO: for now just stop here
+            Disconnect-VIServer -Confirm:$False
+            exit 1
         }
     }
+    Disconnect-VIServer -Confirm:$False
 }
 
 # Some settings on the appliance might need to be configured based on the information in the prereq sheet
@@ -846,4 +971,5 @@ function Prepare-ComponentAppliances
 Parse-PrereqComponents
 Parse-ConnectivityPrereqs
 #Check-DNSPrereqs
+Create-ComponentAppliances
 echo "Done"
