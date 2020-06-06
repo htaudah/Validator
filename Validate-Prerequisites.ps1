@@ -35,6 +35,8 @@ $C_COMPONENTS_HEADER = 'Final Workspace ONE Components'
 $C_ACCOUNTS_HEADER = 'Service Accounts'
 $C_REQUIRED = 'Required'
 $C_COMPONENTS = 'Components'
+$C_SOURCE_COMPONENT = 'Source Component'
+$C_DESTINATION_COMPONENT = 'Destination Component'
 $C_HOSTNAMES = 'Server Hostname(s)'
 $C_SERVER_IPS = 'Server IP(s)'
 $C_DNS_RECORD = 'DNS (VIP) Record'
@@ -351,8 +353,8 @@ function Parse-PrereqComponents
         }
 
         $resources[$resource_name] = [PSCustomObject]@{
-            Hostnames = $datarow.$C_HOSTNAMES
-            IPs = $datarow.$C_SERVER_IPS
+            Hostnames = $name_lines
+            IPs = $server_ip_lines
         }
     }
 }
@@ -363,7 +365,8 @@ function Parse-ConnectivityPrereqs
     foreach ($worksheet in $worksheets)
     {
         #TODO: remove this when done testing
-        if ($worksheet -ne 'Access (On-Premises)' -and $worksheet -ne 'DS-AWCM-API (On-Premises)') {continue}
+        #if ($worksheet -ne 'Access (On-Premises)' -and $worksheet -ne 'DS-AWCM-API (On-Premises)') {continue}
+        if ($worksheet -ne 'Tunnel & Content Gateway') {continue}
         Write-Log $worksheet
         
         # Find correct ranges for all the information
@@ -376,28 +379,41 @@ function Parse-ConnectivityPrereqs
             $cell_index = "B" + $i
             $cell = $cells[$cell_index]
 
-            if ($cell.Text -eq $C_NETWORK_REQUIREMENTS)
+            # Still searching for starting index
+            if ($network_index -eq -1)
             {
-                $network_index = $i + 2
-                break
+                if ($cell.Text -eq $C_NETWORK_REQUIREMENTS)
+                {
+                    $network_index = $i + 2
+                }
+            }
+            # Searching for ending index
+            else
+            {
+                # the section ends with the first empty cell in column B that comes after the start index
+                if ($i -gt $network_index -and $cell.Text.Length -eq 0)
+                {
+                    $network_index_end = $i - 1
+                    break
+                }
             }
         }
 
         if ($network_index -gt 0)
         {
             # Import at the proper starting row
-            $real_data = Import-Excel -Path $SheetPath -WorksheetName $worksheet -StartRow $network_index
+            $real_data = Import-Excel -Path $SheetPath -WorksheetName $worksheet -StartRow $network_index -EndRow $network_index_end
             # Now we can cycle through the actual network-related rows
             foreach ($line in $real_data)
             {
-                # Ignore any rows not applicable
-                if ($line.Status -eq "N/A")
+                # Ignore any rows with status not set to "Pending"
+                if ($line.Status -ne "Pending")
                 {
                     continue
                 }
                 # Just get the component names, and rely on the information imported from the first worksheet
                 # This is why the names need to match!
-                $source = $components[$line.'Source Component']
+                $source = $components[$line.$C_SOURCE_COMPONENT]
                 if ($source -eq $null)
                 {
                     # TODO: are there ever source pseudo-components?
@@ -405,7 +421,7 @@ function Parse-ConnectivityPrereqs
                 else
                 {
                     # No longer storing component in prereq_table, but relying on standard names everywhere
-                    $source = "COMPONENT:$($line.'Source Component')"
+                    $source = "COMPONENT:$($line.$C_SOURCE_COMPONENT)"
                 }
                 # NOTE: Unlike the destination, the source can never be an IP address; it will always relate to a component
 
@@ -429,12 +445,12 @@ function Parse-ConnectivityPrereqs
                 if ($destination -eq $null)
                 {
                     $destination = @()
-                    $line.'Destination Component'.Split("`n") | ForEach-Object { if (is_url($_.Trim())) {$destination += $_} }
+                    $line.$C_DESTINATION_COMPONENT.Split("`n") | ForEach-Object { if (is_url($_.Trim())) {$destination += $_} }
                 }
                 else
                 {
                     # again, we're no longer storing the full components in the prereq_table
-                    $destination = "COMPONENT:$($line.'Destination Component')"
+                    $destination = "COMPONENT:$($line.$C_DESTINATION_COMPONENT)"
                 }
                 # there will be a connection entry for each port/protocol. Be sure to include separate ports/protocols
                 # on separate lines. The number of protocol and port lines must always match
@@ -872,20 +888,20 @@ function Create-ComponentAppliances
         Disconnect-VIServer -Confirm:$False
         exit 1
     }
-    # Keep track of DNS VIPs created to avoid duplicates for alias components
-    $processed_components = @()
     # Create all components parsed from the first sheet
     foreach ($component_name in $components.Keys)
     {
         $component = $components[$component_name]
-        # Skip components that don't have auto-prepare fields (these must be aliases)
-        # Skip components that were already processed (through an alias) as well as local components
-        if ($local_components -contains $component_name -or $component.ComputeNodes -eq $null)
+        # Skip component if one of the following is true:
+        # (i) it doesn't have auto-prepare fields (must be an alias to another component)
+        # (ii) it doesn't have a hostname (e.g. Database components)
+        # (iii) it's a localhost component (e.g. user browser, end user device, etc...)
+        if ($local_components -contains $component_name -or $component.ComputeNodes -eq $null -or $component.Hostnames[0] -eq "N/A")
         {
             continue
         }
         # We'll need to create a separate appliance for each server belonging to the component
-        foreach ($i in 0..$component.Hostnames.Count)
+        foreach ($i in 0..($component.Hostnames.Count - 1))
         {
             $vm = Get-VM -Name ("TinyCore_$($component_name)_$i") -ErrorAction Ignore
             if ($vm -ne $null)
@@ -896,6 +912,11 @@ function Create-ComponentAppliances
             }
             $vm = New-VM -Template $tc_template -Name ("TinyCore_$($component_name)_$i") -VMHost $component.ComputeNodes[$i]`
                 -Datastore $component.Datastores[$i] -PortGroup (Get-VDPortGroup -Name $component.VMNetworks[$i])
+            if ($vm -eq $null)
+            {
+                Write-Failure "Failed to create validation appliance for component `"$component_name`""
+                exit 1
+            }
             # Set the OVF props according to component properties
             $vm_props = @{
                 'guestinfo.hostname' = $component.Hostnames[$i]
@@ -906,9 +927,6 @@ function Create-ComponentAppliances
             }
             Set-VMOvfProperty -VM $vm $vm_props
             #Start-VM -VM $vm
-            # TODO: for now just stop here
-            Disconnect-VIServer -Confirm:$False
-            exit 1
         }
     }
     Disconnect-VIServer -Confirm:$False
@@ -925,15 +943,20 @@ function Prepare-ComponentAppliances
     {
         $destination = $connection[1]
         # If it's not a component, there's no appliance for it and we don't care
-        if ($destination.GetType() -ne 'PSCustomType')
+        if ($destination -notmatch '^COMPONENT:')
         {
             continue
         }
-        # reminder: connection[2] is the protocol
-        if ($connection[2] -match "HTTP")
+        $destination_component = $components[$destination.Substring(10)]
+        # reminder: connection[3] is the protocol
+        if ($connection[3] -match "HTTP")
         {
-            foreach ($host_ip in $destination.IPs)
+            foreach ($host_ip in $destination_component.IPs)
             {
+                if ($destination_component.IPs -match "77.200")
+                {
+                    echo "hey there"
+                }
                 if ($appliance_ports[$host_ip] -eq $null)
                 {
                     $appliance_ports[$host_ip] = @()
@@ -946,7 +969,7 @@ function Prepare-ComponentAppliances
     foreach ($host_ip in $appliance_ports.Keys)
     {
         # all ports for this appliance
-        $key_appliance_ports = $appliance_ports[$key]
+        $host_appliance_ports = $appliance_ports[$host_ip]
         # Connect to appliance and edit lighttpd configuration to specified port
         $cred = New-Object -TypeName System.Management.Automation.PSCredential -ArgumentList $SSH_USERNAME, $SECURE_SSH_PASSWORD
         try {
@@ -956,20 +979,25 @@ function Prepare-ComponentAppliances
             Write-Failure "ERROR: An SSH session could not be established to prepare component `'$component`'. "`
                 + "The error details are printed below:`n"`
                 + $_.Exception.Message;
+            
+            continue
         }
-        $ssl_state = if ($key_applicance_ports[1] -match "HTTPS") {"enabled"} else {"disabled"}
+        $ssl_state = if ($host_applicance_ports[1] -match "HTTPS") {"enabled"} else {"disabled"}
         # clear out any previous configuration that might be there and kill the process if it's running
         Invoke-SSHCommand -SSHSession $session -Command "sudo sed '/SERVER[/d' /var/www/lighttpd.conf"
         Invoke-SSHCommand -SSHSession $session -Command "sudo kill ``cat /var/www/server.pid-file``"
         # and set the new port/ssl configurations
-        Invoke-SSHCommand -SSHSession $session -Command "sudo echo $SERVER[`"socket`"] == `":$key_appliance_ports[0]`" {ssl.engine = `"$ssl_state`"}"
+        Invoke-SSHCommand -SSHSession $session -Command "sudo echo $SERVER[`"socket`"] == `":$host_appliance_ports[0]`" {ssl.engine = `"$ssl_state`"} >> /var/www/lighttpd.conf"
         Invoke-SSHCommand -SSHSession $session -Command "sudo /usr/local/sbin/lighttpd -f /var/www/lighttpd.conf"
         Remove-SSHSession $session
+        # for now stop at the first one
+        exit 1
     }
 }
 
 Parse-PrereqComponents
 Parse-ConnectivityPrereqs
 #Check-DNSPrereqs
-Create-ComponentAppliances
+#Create-ComponentAppliances
+Prepare-ComponentAppliances
 echo "Done"
