@@ -961,7 +961,7 @@ function Prepare-ComponentAppliances
                 {
                     $appliance_ports[$host_ip] = @()
                 }
-                $appliance_ports[$host_ip] += @($connection[2], $connection[3])
+                $appliance_ports[$host_ip] += ,@($connection[2], $connection[3])
             }
         }
     }
@@ -982,12 +982,19 @@ function Prepare-ComponentAppliances
             
             continue
         }
-        $ssl_state = if ($host_applicance_ports[1] -match "HTTPS") {"enabled"} else {"disabled"}
         # clear out any previous configuration that might be there and kill the process if it's running
         Invoke-SSHCommand -SSHSession $session -Command "sudo sed '/SERVER[/d' /var/www/lighttpd.conf"
+        # TODO: fix this == typo in the actual appliance
+        Invoke-SSHCommand -SSHSession $session -Command "sudo sed -i 's/==/=/g' /var/www/lighttpd.conf"
+        Invoke-SSHCommand -SSHSession $session -Command "sudo sed '/SERVER[/d' /var/www/lighttpd.conf"
         Invoke-SSHCommand -SSHSession $session -Command "sudo kill ``cat /var/www/server.pid-file``"
-        # and set the new port/ssl configurations
-        Invoke-SSHCommand -SSHSession $session -Command "sudo echo $SERVER[`"socket`"] == `":$host_appliance_ports[0]`" {ssl.engine = `"$ssl_state`"} >> /var/www/lighttpd.conf"
+        # and set the new port/ssl configurations. There will be an additional line for every port to listen on
+        foreach ($host_appliance_port in $host_appliance_ports)
+        {
+            $ssl_state = if ($host_appliance_port[1] -match "HTTPS") {"enable"} else {"disable"}
+            Invoke-SSHCommand -SSHSession $session `
+                -Command "sudo echo \`$SERVER[\`"socket\`"] == \`"*:$($host_appliance_port[0])\`" {ssl.engine = \`"$ssl_state\`"} >> /var/www/lighttpd.conf"
+        }
         Invoke-SSHCommand -SSHSession $session -Command "sudo /usr/local/sbin/lighttpd -f /var/www/lighttpd.conf"
         Remove-SSHSession $session
         # for now stop at the first one

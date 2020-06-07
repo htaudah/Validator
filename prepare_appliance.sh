@@ -83,6 +83,9 @@ sudo openssl req -new -sha256 -nodes -out ${PREFIX}/etc/ssl/certs/webselfsigned.
 sudo openssl x509 -req -in ${PREFIX}/etc/ssl/certs/webselfsigned.csr -CA ${PREFIX}/etc/ssl/certs/rootselfsigned.pem \
     -CAkey ${PREFIX}/etc/ssl/keys/rootselfsigned.key -CAcreateserial -out ${PREFIX}/etc/ssl/certs/webselfsigned.crt -days 1825 -sha256
 
+# Change ownership of all keys/certs to tc:staff, as that is what web server will run as
+sudo chown tc:staff ${PREFIX}/etc/ssl/certs/*
+
 # Prepare a dummy site for responses
 sudo mkdir -p ${PREFIX}/var/www/test
 sudo mkdir -p ${PREFIX}/var/www/uploads
@@ -101,9 +104,9 @@ server.document-root = "/var/www/test"
 server.username = "tc"
 server.groupname = "staff"
 #server.chroot = "/var/www"
-server.upload-dirs=("/var/www/uploads")
-server.pid-file == "/var/www/server.pid"
-index-file.names=("index.html")
+server.upload-dirs = ("/var/www/uploads")
+server.pid-file = "/var/www/server.pid"
+index-file.names = ("index.html")
 #ssl enabled for all, then disabled as-needed per port
 ssl.engine = "enable"
 ssl.pemfile = "/etc/ssl/certs/webselfsigned.crt"
