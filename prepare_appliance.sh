@@ -12,7 +12,7 @@ fi
 # Get path the script is running from
 SCRIPT=`realpath $0`
 SCRIPTPATH=`dirname $SCRIPT`
-
+SCRIPTBASE=`basename $0`
 
 # This part should be skipped if running from the appliance itself
 if [ $1 != 'localhost' ]; then
@@ -22,7 +22,9 @@ if [ $1 != 'localhost' ]; then
     ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i ${SCRIPTPATH}/id_rsa tc@$1 "mkdir /home/tc/work"
     scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i ${SCRIPTPATH}/id_rsa ${SCRIPTPATH}/*.sh tc@$1:/home/tc/work
     # Now just continue the script from the appliance itself and exit
-    #ssh -i ./id_rsa tc@$1
+    ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i ./id_rsa tc@$1 << EOF
+/home/tc/work/${SCRIPTBASE} localhost
+EOF
     exit 0
 fi
 
@@ -55,6 +57,8 @@ tce-load -wi pcre.tcz
 # Web server
 tce-load -wi attr.tcz
 tce-load -wi lighttpd.tcz
+# BusyBox wget is too limited
+tce-load -wi curl.tcz
 # keep them in a safe place without extensions needed only for creating the image
 mkdir -p /tmp/tcz/optional
 cp /tmp/tce/optional/* /tmp/tcz/optional/
@@ -82,29 +86,35 @@ sudo openssl req -new -sha256 -nodes -out ${PREFIX}/etc/ssl/certs/webselfsigned.
     -keyout ${PREFIX}/etc/ssl/keys/webselfsigned.key -subj "/C=SA/ST=Riyadh/L=Riyadh/O=VMWare/OU=Workspace ONE/CN=*"
 sudo openssl x509 -req -in ${PREFIX}/etc/ssl/certs/webselfsigned.csr -CA ${PREFIX}/etc/ssl/certs/rootselfsigned.pem \
     -CAkey ${PREFIX}/etc/ssl/keys/rootselfsigned.key -CAcreateserial -out ${PREFIX}/etc/ssl/certs/webselfsigned.crt -days 1825 -sha256
+# tc user will need access to certs and keys to run webserver
+sudo chown tc:staff ${PREFIX}/etc/ssl/keys/*
+sudo chown tc:staff ${PREFIX}/etc/ssl/certs/*
 
 # Prepare a dummy site for responses
 sudo mkdir -p ${PREFIX}/var/www/test
 sudo mkdir -p ${PREFIX}/var/www/uploads
 sudo chown tc:staff ${PREFIX}/var/www/test
+sudo chown tc:staff ${PREFIX}/var/www/uploads
+sudo chown tc:staff ${PREFIX}/var/www
 echo "<html>" >> ${PREFIX}/var/www/test/index.html
 echo "  <body>" >> ${PREFIX}/var/www/test/index.html
 echo "    Hello friend" >> ${PREFIX}/var/www/test/index.html
 echo "  </body>" >> ${PREFIX}/var/www/test/index.html
 echo "</html>" >> ${PREFIX}/var/www/test/index.html
-# A lighttpd conf suitable for testing
-sudo touch ${PREFIX}/var/www/lighttpd.conf
-sudo chown tc:staff ${PREFIX}/var/www/lighttpd.conf
-sudo cat << EOF > ${PREFIX}/var/www/lighttpd.conf
+sudo chown tc:staff ${PREFIX}/var/www/test/index.html
+# A template lighttpd conf suitable for validation testing
+sudo touch ${PREFIX}/var/www/lighttpd_template.conf
+sudo chown tc:staff ${PREFIX}/var/www/lighttpd_template.conf
+sudo cat << EOF > ${PREFIX}/var/www/lighttpd_template.conf
 mimetype.assign = (".html" => "text/html")
 server.document-root = "/var/www/test"
 server.username = "tc"
 server.groupname = "staff"
 #server.chroot = "/var/www"
-server.upload-dirs=("/var/www/uploads")
-server.pid-file == "/var/www/server.pid"
+server.upload-dirs = ("/var/www/uploads")
+server.pid-file = "/var/www/server.pid"
 index-file.names=("index.html")
-#ssl enabled for all, then disabled as-needed per port
+#below lines will be commented if ssl is not needed
 ssl.engine = "enable"
 ssl.pemfile = "/etc/ssl/certs/webselfsigned.crt"
 ssl.privkey = "/etc/ssl/keys/webselfsigned.key"

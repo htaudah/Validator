@@ -9,7 +9,7 @@ source files. If you already have the ova appliance file available, you may skip
 
 Start by downloading the Core-current.iso file from [here](http://tinycorelinux.net/downloads.html) and creating a
 virtual machine that boots into the ISO file. The first steps will need to be performed on the console of the virtual
-machine.
+machine itself.
 
 > :warning: **Make sure to change Virtual Device Node setting to IDE 0 for the Virtual Machine's hard disk, as
 Tiny Core doesn't recognize the default SCSI device**
@@ -30,7 +30,8 @@ to the virtual machine. When prompted, enter the password vmbox.
 ./prepare\_appliance.sh APPLIANCE\_IP
 ```
 
-When appliance preparation is complete, the virtual machine will be shut down to prepare for OVF export.
+When appliance preparation is complete, the virtual machine will be shut down to prepare for OVF export. Disconnect
+the TinyCore ISO so prevent the machine from booting into the ISO next time.
 
 Before exporting the machine to OVF, you'll need to enable the vApp options that will be used to configure the
 appliance during deployment. You can follow the guide [here]() for information on how to create vApp options.

@@ -57,7 +57,6 @@ $C_PORTS = 'Port(s)'
 $C_DESTINATION_COMPONENT = 'Destination Component'
 $C_DEVICES = 'Devices on Internet or Wi-Fi'
 $C_BROWSER = 'Browser'
-$C_BROWSER_ADMIN = 'Browser (for admin access)'
 $C_APPLIANCE_AUTO_PREPARATION = 'Appliance Auto-Preparation'
 $C_VCENTER_SERVER = 'vCenter FQDN'
 $C_QUESTIONNAIRE = 'Questionnaire'
@@ -75,16 +74,6 @@ $C_SSL_BRIDGING = 'Bridging'
 $C_SSL_OFFLOADING = 'Offloading'
 $C_NA = 'N/A'
 
-# For compatibility reasons, check if running under PowerShell Core
-if (Get-Command Test-NetConnection -ErrorAction Ignore)
-{
-    $powershell_core = $False
-}
-else
-{
-    $powershell_core = $True
-}
-
 # This is a list of URLs with wildcards or other special characters that need to be converted into actual
 # URLs for testing. These are only used when for URLs for which the default method of swapping the *
 # with www does not result in a valid URL.
@@ -93,11 +82,10 @@ $wildcard_urls = @{
     "\*.gvt1.com" = "redirector.gvt1.com"
     "\*.gvt2.com" = "beacons.gvt2.com"
     "\*.gvt3.com" = "beacons5.gvt3.com"
-    "\*.notify.live.net" = "sn.notify.live.net"
-    "\*.phobos.apple.com.edgesuite.net" = "ax.phobos.apple.com.edgesuite.net"
-    "\*.phobos.apple.com" = "a1865.phobos.apple.com"
-    "\*.googleapis.com" = "gcm.googleapis.com"
 }
+
+# This will be used to hold the results excel package
+$result_excel = $null
 
 # Questionnaire answers that are relevant to the script
 $auto_prepare = $null
@@ -130,7 +118,7 @@ $worksheets = $excel_pkg.Workbook.Worksheets | ForEach-Object {$_.Name}
 # physical device (e.g. 'Devices on Wi-Fi or Internet')
 $components = @{}
 # These are the components that are actually represented by the machine running the test.
-$local_components = @($C_DEVICES, $C_BROWSER_ADMIN)
+$local_components = @($C_DEVICES, $C_BROWSER)
 foreach ($local_component in $local_components)
 {
     $components[$local_component] = [PSCustomObject]@{
@@ -156,7 +144,7 @@ function Write-Log($message)
 # TODO: is this regex good enough?
 function is_url($url)
 {
-    return ($url -match "^(\*\.)?([a-zA-Z\d\-]+\.)*[a-zA-Z\d\-]+$")
+    return ($url -match "^([a-zA-Z\d\-]+\.)*[a-zA-Z\d\-]+$")
 }
 function is_ip($ip_address)
 {
@@ -387,11 +375,9 @@ function Parse-ConnectivityPrereqs
     foreach ($worksheet in $worksheets)
     {
         #TODO: remove this when done testing
-        #if ($worksheet -ne 'DS-AWCM-API (On-Premises)') {continue}
-        #if ($worksheet -ne 'Access (On-Premises)') {continue}
+        if ($worksheet -ne 'DS-AWCM-API (On-Premises)') {continue}
         #if ($worksheet -ne 'Tunnel & Content Gateway') {continue}
-        
-        Write-Log "Parsing sheet `"$worksheet`" for network rules"
+        Write-Log $worksheet
         
         # Find correct ranges for all the information
         $cells = $excel_pkg.$worksheet.Cells
@@ -441,7 +427,6 @@ function Parse-ConnectivityPrereqs
                 if ($source -eq $null)
                 {
                     # TODO: are there ever source pseudo-components?
-                    # TODO: are there ever source resources?
                 }
                 else
                 {
@@ -464,15 +449,6 @@ function Parse-ConnectivityPrereqs
                         $bypass_vip = $true
                     }
                 }
-                # If destination is still $null, it might be a resource (see Worksheet to understand disctinction)
-                if ($destination -eq $null)
-                {
-                    $destination = $resources[$line.$C_DESTINATION_COMPONENT]
-                    if ($destination -ne $null)
-                    {
-                        $destination = "RESOURCE:$($line.$C_DESTINATION_COMPONENT)"
-                    }
-                }
 
                 # Connectivity tests will differ depending on whether the destination is a component, or just an IP address
                 # Whatever it is, though, it gets stored in $destination
@@ -481,7 +457,7 @@ function Parse-ConnectivityPrereqs
                     $destination = @()
                     $line.$C_DESTINATION_COMPONENT.Split("`n") | ForEach-Object { if (is_url($_.Trim())) {$destination += $_} }
                 }
-                elseif ($destination -notmatch "^RESOURCE:")
+                else
                 {
                     # again, we're no longer storing the full components in the prereq_table
                     $destination = "COMPONENT:$($line.$C_DESTINATION_COMPONENT)"
@@ -663,37 +639,32 @@ function Check-InstalledFeatures([string]$server_ip, [string[]]$feature_names)
 function Check-ComponentConnectivity
 {
     # Go through the parsed connectivity requirements and test them
-    $rule_number = 1
-    $total_rules = $prereq_table.CONNECTIVITY.Count
-    Write-Log "$total_rules network rules to check..."
     foreach ($connection in $prereq_table.CONNECTIVITY)
     {
-        Write-Progress -Id 1 -Activity "Checking network rule $rule_number of $total_rules" -PercentComplete ($rule_number / $total_rules * 100)
-        $rule_number += 1
-        # As mentioned, the source must be a component
-        $source = $connection[0]
-        $destination = $connection[1]
-        # If port is not a number, connection is untestable
-        if (-Not [Int32]::TryParse($connection[2], [ref]$null))
+        #TODO: remove when done testing
+        if ($connection[0] -notmatch "UAG Relay for Tunnel")
         {
             continue
         }
+        # As mentioned, the source must be a component
+        $source = $connection[0]
+        $destination = $connection[1]
         # If either one refers to a component, get the component
         $source = if ($source -match "^COMPONENT:") { $components[$source.Substring(10)] } else { $source }
+        $destination = if ($destination -match "^COMPONENT:") { $components[$destination.Substring(10)] } else { $destination }
         # Connection to the destination VIP must be tested from each source server
         foreach ($source_ip in $source.IPs)
         {
-            # Destination can be a component, resource, or web URL
-            if ($destination -match '^COMPONENT:')
+            # Destination is either a component or IP
+            if ($destination.GetType() -ne [string])
             {
-                $destination = $components[$destination.Substring(10)]
                 # Should the test be to the destination VIP or individual servers (e.g. non-load balanced components,
                 # destination with (Servers) appended)?
                 if ($destination.DNSIP -eq $null -or $connection[3] -eq $true)
                 {
                     foreach ($destination_ip in $destination.SERVERIPs)
                     {
-                        $connection[5] = Check-ConnectionBetween $source_ip $destination_ip $connection[2] $connection[3] $False
+                        $connection[5] = Check-ConnectionBetween $source_ip $destination_ip $connection[2]
                         # NOTE: there will be one result for each row in the network requirements. So we stop
                         # at the first failure, but report the exact source IP and destination IP (since each row
                         # may contain multiple source and/or destination IPs)
@@ -705,7 +676,7 @@ function Check-ComponentConnectivity
                 }
                 else
                 {
-                    $connection[5] = Check-ConnectionBetween $source_ip $destination.DNSIP $connection[2] $connection[3] $False
+                    $connection[5] = Check-ConnectionBetween $source_ip $destination.DNSIP $connection[2]
                     # For load-balanced destinations, also check if the destination SSL handling is accurate
                     if ($connection[5] -match "PASSED")
                     {
@@ -762,15 +733,9 @@ function Check-ComponentConnectivity
                     }
                 }
             }
-            elseif ($destination -match '^RESOURCE:')
-            {
-                # TODO: is first IP good enough for all resources?
-                $destination = $resources[$destination.Substring(9)].IPs[0]
-                $connection[5] = Check-ConnectionBetween $source_ip $destination $connection[2] $connection[3] $False
-            }
             else
             {
-                $connection[5] = Check-ConnectionBetween $source_ip $destination $connection[2] $connection[3] $True
+                $connection[5] = Check-ConnectionBetween $source_ip $destination $connection[2]
             }
 
             # If a failure was reported for any source IPs, no need to carry on with the rest since, as we said,
@@ -784,157 +749,54 @@ function Check-ComponentConnectivity
 }
 
 # Checks if the $source machine is able to reach the $destination machine
-# If the $source machine is 'localhost', the test is run directly from the running PowerShell instance
-# If the $destination is a Web URL, and a $Proxy parameter is defined, the test is done by attempting
-# to pull the web content from the destination and checking for the $ProxyDenialString, which is
-# a string in the proxy response indicating the request was blocked
-function Check-ConnectionBetween([string]$source, $destination, [int]$port, [string]$protocol, [bool]$is_web_url)
+# on port $port, by running the check_connection script built in to the appliance
+function Check-ConnectionBetween([string]$source, $destination, [int]$port)
 {
-    if ($is_web_url)
-    {
-        # Some internet URL wildcards must be replaced with a specific known URL for testing
-        # These were determined through trial-and-error
-        foreach ($key in $wildcard_urls.Keys)
-        {
-            $replacement = $wildcard_urls[$key]
-            $destination = $destination -replace $key,$replacement
-        }
-        $destination = $destination -replace "\*.notify.live.net","sn.notify.live.net"
-        $destination = $destination -replace "\*.phobos.apple.com.edgesuite.net","ax.phobos.apple.com.edgesuite.net"
-        # Random number for the Apple URL
-        $destination = $destination -replace "#","$(Get-Random -Minimum 0 -Maximum 200)"
-        # Any remaining wildcards can just be replace with www
-        $destination = $destination -replace "\*","www"
-    }
     # If $source is 'localhost' the connectivity test needs to be conducted directly from the machine running
     # the validation script (e.g. will be the case for tests for internal devices)
     if ($source -eq 'localhost')
     {
-        if ($is_web_url -and $ProxyServer.Length -gt 0)
+        if (is_url($destination))
         {
-            try
-            {
-                # The SkipHttpErrorCheck parameter avoids much grief
-                if ((Get-Command Invoke-WebRequest).Parameters.ContainsKey("SkipHttpErrorCheck"))
-                {
-                    $response = Invoke-WebRequest -Uri "$($destination):$($port)" -Proxy $ProxyServer -SkipHttpErrorCheck
-                }
-                else
-                {
-                    $response = Invoke-WebRequest -Uri "$($destination):$($port)" -Proxy $ProxyServer
-                }
-                if ($response.Content -match "$ProxyDenialString")
-                {
-                    return $("FAILED: Proxy response contains the specified `$ProxyDenialString, indicating "`
-                        + "that a response was not correctly received from the destination.")
-                }
-            }
-            catch
-            {
-                if ($_.Exception.Response -eq $null)
-                {
-                    return "FAILED: A response could not be retrieved from the destination."
-                }
-                # As a response was received, it might still be ok as long as the error response came
-                # from the intended destination (e.g. some URLs return 404 when tested directly)
-                if ($powershell_core)
-                {
-                    # Running PowerShell Core but without the SkipHttpErrorCheck, so this mangled output
-                    # is the best we can do (but it should still capture Proxy Denial String if chosen wisely)
-                    if ($_.ErrorDetails.Message -match $ProxyDenialMessage)
-                    {
-                        return $("FAILED: Proxy response contains the specified `$ProxyDenialString, indicating "`
-                            + "that a response was not correctly received from the destination.")
-                    }
-                }
-                else
-                {
-                    # With legacy PowerShell, this is how you get the HTTP response with an error response code
-                    $stream = $_.Exception.Response.GetResponseStream()
-                    $stream.Position = 0
-                    $reader = [System.IO.StreamReader]::new($stream)
-                    $response = $reader.ReadToEnd()
-
-                    if ($response -match "$ProxyDenialString")
-                    {
-                        return $("FAILED: Proxy response contains the specified `$ProxyDenialString, indicating "`
-                            + "that a response was not correctly received from the destination.")
-                    }
-                }
-                # If we reached here, then a response was received that doesn't contain the proxy denial string
-                # so we are ok
-                return "PASSED"
-            }
+            # Some internet URL wildcards must be replaced with a specific known URL for testing
+            # These were determined through trial-and-error
+            $destination = $destination -replace "\*.notify.live.net","sn.notify.live.net"
+            $destination = $destination -replace "\*.phobos.apple.com.edgesuite.net","ax.phobos.apple.com.edgesuite.net"
+            # Random number for the Apple URL
+            $destination = $destination -replace "#","$(Get-Random -Minimum 0 -Maximum 200)"
+            # Any remaining wildcards can just be replace with www
+            $destination = $destination -replace "\*","www"
+        }
+        $result = Test-NetConnection -ComputerName $destination -Port $port
+        if ($result.TcpTestSucceeded)
+        {
+            return "PASSED"
         }
         else
         {
-            # Test-NetConnection was removed in PowerShell Core
-            if (-Not $powershell_core)
-            {
-                $result = (Test-NetConnection -ComputerName $destination -Port $port).TcpTestSucceeded
-            }
-            else
-            {
-                $result = Test-Connection -ComputerName $destination -TCPPort $port
-            }
-            if ($result)
-            {
-                return "PASSED"
-            }
-            else
-            {
-                return $("FAILED: A TCP connection could not be established to the specified destination and port. "`
-                    + "Note that tests labeled for 'Devices on Internet or Wi-Fi' are executed from the device "`
-                    + "running the validation script.")
-            }
+            return $("FAILED: A TCP connection could not be established to the specified destination and port. "`
+                + "Note that tests labeled for 'Devices on Internet or Wi-Fi' are executed from the device "`
+                + "running the validation script.")
         }
     }
     $cred = New-Object -TypeName System.Management.Automation.PSCredential -ArgumentList $SSH_USERNAME, $SECURE_SSH_PASSWORD
     try {
-        $session = New-SSHSession -ComputerName $source -Force -Credential $cred -ErrorAction Stop -WarningAction SilentlyContinue
+        $session = New-SSHSession -ComputerName $source -Force -Credential $cred -ErrorAction Stop
     }
     catch {
         return $("FAILED: An SSH session could not be established to the source machine `"$source`" to begin the test."`
             + "The error details are printed below:`n"`
             + $_.Exception.Message)
     }
-    # Just as was done above, we use the telnet test unless it's a Web URL and a $Proxy is specified
-    if ($is_web_url -and $ProxyServer.Length -gt 0)
+    $result = Invoke-SSHCommand -SSHSession $session -Command "nc -w $ConnectionTimeout -z $destination $port"
+    Remove-SSHSession $session | Out-Null
+    if ($result.ExitStatus -eq 0)
     {
-        # TODO: handle the protocol prefix
-        $prefix = if ($protocol -match "HTTPS") { "https://" } else { "http://" }
-        $result = Invoke-SSHCommand -SSHSession $session -Command "curl $($prefix)$($destination):$($port) --proxy $ProxyServer"
-        Remove-SSHSession $session | Out-Null
-        # curl is more well-behaved; an error response code does not trigger an exit code
-        if ($result.ExitStatus -eq 0)
-        {
-            if ($result.Output -notmatch "$ProxyDenialString")
-            {
-                return "PASSED"
-            }
-            else
-            {
-                return $("FAILED: Proxy response contains the specified `$ProxyDenialString, indicating "`
-                        + "that a response was not correctly received from the destination.")
-            }
-        }
-        else
-        {
-            return "FAILED: A TCP connection could not be established to the specified destination and port."
-        }
+        return "PASSED"
     }
     else
     {
-        $result = Invoke-SSHCommand -SSHSession $session -Command "nc -w $ConnectionTimeout -z $destination $port"
-        Remove-SSHSession $session | Out-Null
-        if ($result.ExitStatus -eq 0)
-        {
-            return "PASSED"
-        }
-        else
-        {
-            return "FAILED: A TCP connection could not be established to the specified destination and port."
-        }
+        return "FAILED: A TCP connection could not be established to the specified destination and port."
     }
 }
 
@@ -943,7 +805,7 @@ function Get-ServerThumbprint([string]$source, [string]$destination, [int]$port)
 {
     $cred = New-Object -TypeName System.Management.Automation.PSCredential -ArgumentList $SSH_USERNAME, $SECURE_SSH_PASSWORD
     try {
-        $session = New-SSHSession -ComputerName $source -Force -Credential $cred -ErrorAction Stop -WarningAction SilentlyContinue
+        $session = New-SSHSession -ComputerName $source -Force -Credential $cred -ErrorAction Stop
     }
     catch {
         return "FAILED: An SSH session could not be established to the source machine to begin the test. "`
@@ -962,8 +824,7 @@ function Get-ServerThumbprint([string]$source, [string]$destination, [int]$port)
 }
 
 # Converts connectivity results into an object ready for printing with Export-Excel
-# If a previous $result_excel is passed in, the returned excel file will include its worksheets
-function Parse-ConnectivityResults($input_excel)
+function Parse-ConnectivityResults
 {
     $result_objects = @()
     foreach ($result in $prereq_table.CONNECTIVITY)
@@ -977,24 +838,19 @@ function Parse-ConnectivityResults($input_excel)
         }
         $result_objects += $result_object
     }
-    if ($result_objects.Count -eq 0)
-    {
-        return $input_excel
-    }
     # if this is the first result, create a new result package
-    if ($input_excel -eq $null)
+    if ($result_excel -eq $null)
     {
         $result_excel = ($result_objects | Export-Excel -PassThru -WorksheetName "Connectivity")
-        return $result_excel
     }
     # otherwise just add a sheet to the existing one
     else
     {
-        return ($result_objects | Export-Excel -ExcelPackage $input_excel -WorksheetName "Connectivity")
+        $result_objects | Export-Excel -ExcelPackage $result_excel -WorksheetName "Connectivity"
     }
 }
 
-function Parse-DNSResults($input_excel)
+function Parse-DNSResults
 {
     $result_objects = @()
     foreach ($key in $prereq_table.DNSRECORDS.Keys)
@@ -1005,29 +861,24 @@ function Parse-DNSResults($input_excel)
         }
         $result_objects += $result_object
     }
-    if ($result_objects.Count -eq 0)
-    {
-        return $input_excel
-    }
     # if this is the first result, create a new result package
-    if ($input_excel -eq $null)
+    if ($result_excel -eq $null)
     {
         $result_excel = ($result_objects | Export-Excel -PassThru -WorksheetName "DNS")
-        return $result_excel
     }
     # otherwise just add a sheet to the existing one
     else
     {
-        return ($result_objects | Export-Excel -ExcelPackage $input_excel -WorksheetName "DNS")
+        $result_objects | Export-Excel -ExcelPackage $result_excel -WorksheetName "DNS"
     }
 }
 
 # Outputs all the results into a Result spreadsheet for easy viewing
 function Print-Results
 {
-    $results = Parse-ConnectivityResults
-    $results = Parse-DNSResults $results
-    Export-Excel -ExcelPackage $results -Show
+    Parse-ConnectivityResults
+    Parse-DNSResults
+    Export-Excel -ExcelPackage $result_excel -Show
 }
 
 # Load Lam's OVF props functions
@@ -1065,11 +916,7 @@ function Create-ComponentAppliances
         # (i) it doesn't have auto-prepare fields (must be an alias to another component)
         # (ii) it doesn't have a hostname (e.g. Database components)
         # (iii) it's a localhost component (e.g. user browser, end user device, etc...)
-        # (iv) Database components, as they are part of the prerequisites
-        if ($local_components -contains $component_name`
-            -or $component.ComputeNodes -eq $null`
-            -or $component.Hostnames[0] -eq "N/A"`
-            -or $component_name -match '\[DB\]')
+        if ($local_components -contains $component_name -or $component.ComputeNodes -eq $null -or $component.Hostnames[0] -eq "N/A")
         {
             continue
         }
@@ -1141,14 +988,8 @@ function Prepare-ComponentAppliances
         }
     }
     # Now we can start lighttpd on all appliances once the configurations are final
-    $appliance_number = 1
-    $total_appliances = $appliance_ports.Keys.Count
-    Write-Log "Configuring $total_appliances validation appliances..."
     foreach ($host_ip in $appliance_ports.Keys)
     {
-        Write-Progress -Id 2 -Activity "Configuring appliance $appliance_number of $total_appliances" `
-            -PercentComplete ($appliance_number / $total_appliances * 100)
-        $appliance_number += 1
         # all ports for this appliance
         $host_appliance_ports = $appliance_ports[$host_ip]
         # Connect to appliance and edit lighttpd configuration to specified port
@@ -1158,8 +999,7 @@ function Prepare-ComponentAppliances
         while ($session -eq $null -and $connection_attempts -lt $ConnectionAttempts)
         {
             try {
-                $session = New-SSHSession -ComputerName $host_ip -Force -Credential $cred -ErrorAction Stop -ConnectionTimeout 5 `
-                    -WarningAction SilentlyContinue
+                $session = New-SSHSession -ComputerName $host_ip -Force -Credential $cred -ErrorAction Stop -ConnectionTimeout 5
             }
             catch {
                 $error_message = $_.Exception.Message
@@ -1228,9 +1068,8 @@ Parse-PrereqComponents
 Parse-ConnectivityPrereqs
 #Check-DNSPrereqs
 #$vms = Create-ComponentAppliances
-Prepare-ComponentAppliances
-Check-ComponentConnectivity
-#Print-Results
+#Prepare-ComponentAppliances
+#Check-ComponentConnectivity
 if ($vms.Count -gt 0 -and $ClearOnExit)
 {
     $vi_server = Connect-VIServer -Server $VsphereFQDN -Credential $VsphereCredentials
