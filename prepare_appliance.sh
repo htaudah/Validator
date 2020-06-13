@@ -90,6 +90,9 @@ sudo openssl x509 -req -in ${PREFIX}/etc/ssl/certs/webselfsigned.csr -CA ${PREFI
 sudo chown tc:staff ${PREFIX}/etc/ssl/keys/*
 sudo chown tc:staff ${PREFIX}/etc/ssl/certs/*
 
+# Change ownership of all keys/certs to tc:staff, as that is what web server will run as
+sudo chown tc:staff ${PREFIX}/etc/ssl/certs/*
+
 # Prepare a dummy site for responses
 sudo mkdir -p ${PREFIX}/var/www/test
 sudo mkdir -p ${PREFIX}/var/www/uploads
@@ -113,7 +116,7 @@ server.groupname = "staff"
 #server.chroot = "/var/www"
 server.upload-dirs = ("/var/www/uploads")
 server.pid-file = "/var/www/server.pid"
-index-file.names=("index.html")
+index-file.names = ("index.html")
 #below lines will be commented if ssl is not needed
 ssl.engine = "enable"
 ssl.pemfile = "/etc/ssl/certs/webselfsigned.crt"
