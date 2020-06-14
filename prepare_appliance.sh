@@ -90,9 +90,6 @@ sudo openssl x509 -req -in ${PREFIX}/etc/ssl/certs/webselfsigned.csr -CA ${PREFI
 sudo chown tc:staff ${PREFIX}/etc/ssl/keys/*
 sudo chown tc:staff ${PREFIX}/etc/ssl/certs/*
 
-# Change ownership of all keys/certs to tc:staff, as that is what web server will run as
-sudo chown tc:staff ${PREFIX}/etc/ssl/certs/*
-
 # Prepare a dummy site for responses
 sudo mkdir -p ${PREFIX}/var/www/test
 sudo mkdir -p ${PREFIX}/var/www/uploads

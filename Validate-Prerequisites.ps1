@@ -163,6 +163,35 @@ function is_ip($ip_address)
     return ($ip_address -match "\b\d{1,3}\.d{1,3}\.d{1,3}\.\d{1,3}\b")
 }
 
+# This SSH pool is used to avoid multiple costly SSH connections to the same host
+$ssh_session_pool = @{}
+# Helper function to either initiate an SSH session to the specified host, or fetch one from the SSH pool
+# if one already exists for this host
+function Get-PoolSSHSession
+{
+    param(
+        [string]$Destination,
+        [PSCredential]$Credential
+    )
+    if (-Not $ssh_session_pool.ContainsKey($Destination) -or $ssh_session_pool[$Destination] -eq $null)
+    {
+        $ssh_session_pool[$Destination] = New-SSHSession -ComputerName $Destination -Force -Credential $Credential `
+            -ErrorAction Stop -WarningAction SilentlyContinue
+    }
+    return $ssh_session_pool[$Destination]
+}
+function Remove-SSHPool
+{
+    foreach ($key in $ssh_session_pool.Keys)
+    {
+        $session = $ssh_session_pool[$key]
+        if ($session -ne $null)
+        {
+            Remove-SSHSession $session | Out-Null
+        }
+    }
+}
+
 # Parses all component information from the Server tab. This function assumes the sections are laid out in the
 # order (Deployment, Environment, Resources, Final WS1 Components)
 function Parse-PrereqComponents
@@ -614,7 +643,22 @@ function Check-DNSPrereqs
 # Helper function to check for existence of single record (called from above function)
 function Check-DNSRecord([string]$record_name, [string]$record_ip, [string]$component_name)
 {
-    $ip = (Resolve-DnsName $record_name -ErrorAction Ignore).IPAddress
+    # Resolve-DnsName is not cross-platform
+    if (Get-Command Resolve-DnsName -ErrorAction Ignore)
+    {
+        $ip = (Resolve-DnsName $record_name -ErrorAction Ignore).IPAddress
+    }
+    else
+    {
+        try
+        {
+            $ip = [System.Net.Dns]::GetHostEntry($record_name)[0].AddressList.IPAddressToString
+        }
+        catch
+        {
+            # $ip will remain $null
+        }
+    }
     if ($ip -eq $null)
     {
         $result = "FAILED: The DNS Record for `'$component_name`' has not been created. "`
@@ -781,6 +825,8 @@ function Check-ComponentConnectivity
             }
         }
     }
+    # The SSH Pool should no longer be needed
+    Remove-SSHPool
 }
 
 # Checks if the $source machine is able to reach the $destination machine
@@ -891,7 +937,8 @@ function Check-ConnectionBetween([string]$source, $destination, [int]$port, [str
     }
     $cred = New-Object -TypeName System.Management.Automation.PSCredential -ArgumentList $SSH_USERNAME, $SECURE_SSH_PASSWORD
     try {
-        $session = New-SSHSession -ComputerName $source -Force -Credential $cred -ErrorAction Stop -WarningAction SilentlyContinue
+        #$session = New-SSHSession -ComputerName $source -Force -Credential $cred -ErrorAction Stop -WarningAction SilentlyContinue
+        $session = Get-PoolSSHSession -Destination $source -Credential $cred
     }
     catch {
         return $("FAILED: An SSH session could not be established to the source machine `"$source`" to begin the test."`
@@ -904,7 +951,7 @@ function Check-ConnectionBetween([string]$source, $destination, [int]$port, [str
         # TODO: handle the protocol prefix
         $prefix = if ($protocol -match "HTTPS") { "https://" } else { "http://" }
         $result = Invoke-SSHCommand -SSHSession $session -Command "curl $($prefix)$($destination):$($port) --proxy $ProxyServer"
-        Remove-SSHSession $session | Out-Null
+        #Remove-SSHSession $session | Out-Null
         # curl is more well-behaved; an error response code does not trigger an exit code
         if ($result.ExitStatus -eq 0)
         {
@@ -926,7 +973,7 @@ function Check-ConnectionBetween([string]$source, $destination, [int]$port, [str
     else
     {
         $result = Invoke-SSHCommand -SSHSession $session -Command "nc -w $ConnectionTimeout -z $destination $port"
-        Remove-SSHSession $session | Out-Null
+        #Remove-SSHSession $session | Out-Null
         if ($result.ExitStatus -eq 0)
         {
             return "PASSED"
@@ -941,23 +988,78 @@ function Check-ConnectionBetween([string]$source, $destination, [int]$port, [str
 # Initiates a SSH session with the source to get the thumbprint seen on the destination
 function Get-ServerThumbprint([string]$source, [string]$destination, [int]$port)
 {
-    $cred = New-Object -TypeName System.Management.Automation.PSCredential -ArgumentList $SSH_USERNAME, $SECURE_SSH_PASSWORD
-    try {
-        $session = New-SSHSession -ComputerName $source -Force -Credential $cred -ErrorAction Stop -WarningAction SilentlyContinue
-    }
-    catch {
-        return "FAILED: An SSH session could not be established to the source machine to begin the test. "`
-            + "The error details are printed below:`n"`
-            + $_.Exception.Message;
-    }
-    $command = "openssl s_client -connect $($destination):$port < /dev/null 2>/dev/null | openssl x509 -fingerprint -noout -in /dev/stdin"
-    $result = Invoke-SSHCommand -SSHSession $session -Command $command
-    Remove-SSHSession $session | Out-Null
-    if ($result.ExitStatus -ne 0)
+    # We'll need to handle getting the thumbprint from both PowerShell and from validation appliances
+    if ($source -eq 'localhost')
     {
-        return "FAILED: attempting to retreive the certificate thumbprint returned exit code $($result.ExitStatus)"
+        # This part adapted from https://tech.zsoldier.com/2018/10/powershell-get-sha256-thumbprint-from.html
+        $Certificate = $null
+        $TcpClient = New-Object -TypeName System.Net.Sockets.TcpClient
+        try
+        {
+            $TcpClient.Connect($destination, $port)
+            $TcpStream = $TcpClient.GetStream()
+        
+            $Callback = { param($sender, $cert, $chain, $errors) return $true }
+        
+            $SslStream = New-Object -TypeName System.Net.Security.SslStream -ArgumentList @($TcpStream, $true, $Callback)
+            try
+            {
+                $SslStream.AuthenticateAsClient($URI)
+                $Certificate = $SslStream.RemoteCertificate
+            }
+            finally {
+                $SslStream.Dispose()
+            }
+        
+        }
+        finally
+        {
+            $TcpClient.Dispose()
+        }
+        
+        if ($Certificate) {
+            if ($Certificate -isnot [System.Security.Cryptography.X509Certificates.X509Certificate2])
+            {
+                $Certificate = New-Object -TypeName System.Security.Cryptography.X509Certificates.X509Certificate2 -ArgumentList $Certificate
+            }
+            $SHA256 = [Security.Cryptography.SHA256]::Create()
+            $Bytes = $Certificate.GetRawCertData()
+            $HASH = $SHA256.ComputeHash($Bytes)
+            $thumbprint = [BitConverter]::ToString($HASH).Replace('-',':')
+            Switch ($SHA256Thumbprint)
+            {
+                $false 
+                {
+                    Write-Output $Certificate
+                }
+                $true 
+                {
+                    Write-Output $thumbprint
+                }
+            }
+        }
     }
-    $thumbprint = $result.Output[0].Substring($result.Output[0].IndexOf('=') + 1)
+    else
+    {
+        $cred = New-Object -TypeName System.Management.Automation.PSCredential -ArgumentList $SSH_USERNAME, $SECURE_SSH_PASSWORD
+        try {
+            #$session = New-SSHSession -ComputerName $source -Force -Credential $cred -ErrorAction Stop -WarningAction SilentlyContinue
+            $session = Get-PoolSSHSession -Destination $source -Credential $cred
+        }
+        catch {
+            return $("FAILED: An SSH session could not be established to the source machine to begin the test. "`
+                + "The error details are printed below:`n"`
+                + $_.Exception.Message)
+        }
+        $command = "openssl s_client -connect $($destination):$port < /dev/null 2>/dev/null | openssl x509 -fingerprint -noout -in /dev/stdin"
+        $result = Invoke-SSHCommand -SSHSession $session -Command $command
+        #Remove-SSHSession $session | Out-Null
+        if ($result.ExitStatus -ne 0)
+        {
+            return "FAILED: attempting to retreive the certificate thumbprint returned exit code $($result.ExitStatus)"
+        }
+        $thumbprint = $result.Output[0].Substring($result.Output[0].IndexOf('=') + 1)
+    }
     return $thumbprint
 }
 
@@ -990,7 +1092,7 @@ function Parse-ConnectivityResults($input_excel)
     # otherwise just add a sheet to the existing one
     else
     {
-        return ($result_objects | Export-Excel -ExcelPackage $input_excel -WorksheetName "Connectivity")
+        return ($result_objects | Export-Excel -ExcelPackage $input_excel -Autosize -PassThru -WorksheetName "Connectivity")
     }
 }
 
@@ -1018,7 +1120,7 @@ function Parse-DNSResults($input_excel)
     # otherwise just add a sheet to the existing one
     else
     {
-        return ($result_objects | Export-Excel -ExcelPackage $input_excel -WorksheetName "DNS")
+        return ($result_objects | Export-Excel -ExcelPackage $input_excel -Autosize -PassThru -WorksheetName "DNS")
     }
 }
 
@@ -1226,10 +1328,10 @@ function Prepare-ComponentAppliances
 
 Parse-PrereqComponents
 Parse-ConnectivityPrereqs
-#Check-DNSPrereqs
+Check-DNSPrereqs
 #$vms = Create-ComponentAppliances
-Prepare-ComponentAppliances
-Check-ComponentConnectivity
+#Prepare-ComponentAppliances
+#Check-ComponentConnectivity
 #Print-Results
 if ($vms.Count -gt 0 -and $ClearOnExit)
 {
