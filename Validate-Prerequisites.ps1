@@ -1,9 +1,11 @@
 ﻿<#
 .SYNOPSIS
-Ensures that environment of the machine running the script is ready for a Workspace ONE deployment.
+Ensures that the environment of the machine running the script is ready for a Workspace ONE deployment.
 .DESCRIPTION
 The Validate-Prerequisites script runs a series of tests for all network requirements listed in the Workspace
 ONE prerequisite sheet.
+.PARAMETER VsphereFQDN
+The FQDN of the VSphere host (either ESXi or vCenter) to use when auto-prepare is enabled
 .PARAMETER VsphereCredentials
 The PSCredential used to connect to VSphere (ESXi or VCenter) for running PowerCLI commands
 .PARAMETER SSH_USERNAME
@@ -17,14 +19,23 @@ The thumbprint of the SSL certificate embedded into the validation appliances
 .PARAMETER ConnectionTimeout
 The number of seconds to wait for a connection to be established when testing for connectivity
 between components.
+.PARAMETER OutputPath
+The path where the Excel file containing the validation results is generated. Leave this blank to have
+the file generated as an unsaved temp file.
+.PARAMETER ClearOnExit
+If true, causes any validation appliances deployed during the validation run to be removed once
+the results have been generated.
+.PARAMETER ConnectionTimeout
+The number of seconds to wait for an SSH connection to be established before the attempt is aborted
+.PARAMETER ConnectionAttempts
+The number of times to attempt an SSH connection to each appliance
 #>
 param(
     [string]$SSH_USERNAME="root",
     [string]$SSH_PASSWORD="vmbox",
     [string]$SheetPath=".\Pre-Install_Requirements.xlsx",
-    # Set this to an empty string to open the result as an unsaved temp file
     [string]$OutputPath="",
-    [string]$SelfSignedThumbprint="D6:7D:11:B0:97:B9:86:48:CB:16:9B:4F:2E:40:EE:1F:59:C7:4C:0B",
+    [string]$SelfSignedThumbprint="56BBF846B4D80BE94D8EBD200A20426E7435FA17",
     [string]$VsphereFQDN="vsphere.haramco.xyz",
     [int]$ConnectionTimeout=5,
     [PSCredential]$VsphereCredentials,
@@ -917,7 +928,7 @@ function Check-ConnectionBetween([string]$source, $destination, [int]$port, [str
             # Test-NetConnection was removed in PowerShell Core
             if (-Not $powershell_core)
             {
-                $result = (Test-NetConnection -ComputerName $destination -Port $port).TcpTestSucceeded
+                $result = (Test-NetConnection -ComputerName $destination -Port $port -WarningAction SilentlyContinue).TcpTestSucceeded
             }
             else
             {
@@ -1007,7 +1018,8 @@ function Get-ServerThumbprint([string]$source, [string]$destination, [int]$port)
                 $SslStream.AuthenticateAsClient($URI)
                 $Certificate = $SslStream.RemoteCertificate
             }
-            finally {
+            finally
+            {
                 $SslStream.Dispose()
             }
         
@@ -1017,26 +1029,13 @@ function Get-ServerThumbprint([string]$source, [string]$destination, [int]$port)
             $TcpClient.Dispose()
         }
         
-        if ($Certificate) {
+        if ($Certificate)
+        {
             if ($Certificate -isnot [System.Security.Cryptography.X509Certificates.X509Certificate2])
             {
                 $Certificate = New-Object -TypeName System.Security.Cryptography.X509Certificates.X509Certificate2 -ArgumentList $Certificate
             }
-            $SHA256 = [Security.Cryptography.SHA256]::Create()
-            $Bytes = $Certificate.GetRawCertData()
-            $HASH = $SHA256.ComputeHash($Bytes)
-            $thumbprint = [BitConverter]::ToString($HASH).Replace('-',':')
-            Switch ($SHA256Thumbprint)
-            {
-                $false 
-                {
-                    Write-Output $Certificate
-                }
-                $true 
-                {
-                    Write-Output $thumbprint
-                }
-            }
+            $thumprint = $Certificate.Thumbprint
         }
     }
     else
@@ -1059,6 +1058,7 @@ function Get-ServerThumbprint([string]$source, [string]$destination, [int]$port)
             return "FAILED: attempting to retreive the certificate thumbprint returned exit code $($result.ExitStatus)"
         }
         $thumbprint = $result.Output[0].Substring($result.Output[0].IndexOf('=') + 1)
+        $thumbprint = $thumbprint -replace ":",""
     }
     return $thumbprint
 }
@@ -1072,10 +1072,17 @@ function Parse-ConnectivityResults($input_excel)
     {
         $result_object = [PSCustomObject]@{
             Source = if ($result[0] -match "^COMPONENT:") { $result[0].Substring(10) } else { $result[0] }
-            Destination = if ($result[1] -match "^COMPONENT:") { $result[1].Substring(10) } else { $result[1] }
+            Destination = `
+                if ($result[1] -cmatch "^(COMPONENT|RESOURCE):") { $result[1].Substring($result[1].IndexOf(":") + 1) } else { $result[1] }
             Port = $result[2].ToString()
             Protocol = $result[3]
             Result = $result[5]
+        }
+        # Google ports 5228-5230 can't be checked
+        # TODO: restrict this exclusion to only google websites?
+        if ($result_object.Port -match "^52(2[8-9]|30)$")
+        {
+            continue
         }
         $result_objects += $result_object
     }
@@ -1124,12 +1131,41 @@ function Parse-DNSResults($input_excel)
     }
 }
 
+function Parse-LoadBalancingResults($input_excel)
+{
+    $result_objects = @()
+    foreach ($key in $prereq_table.LOADBALANCING.Keys)
+    {
+        $result_object = [PSCustomObject]@{
+            "Load Balancer IP" = $key
+            "Result" = $prereq_table.LOADBALANCING[$key]
+        }
+        $result_objects += $result_object
+    }
+    if ($result_objects.Count -eq 0)
+    {
+        return $input_excel
+    }
+    # if this is the first result, create a new result package
+    if ($input_excel -eq $null)
+    {
+        $result_excel = ($result_objects | Export-Excel -PassThru -WorksheetName "DNS")
+        return $result_excel
+    }
+    # otherwise just add a sheet to the existing one
+    else
+    {
+        return ($result_objects | Export-Excel -ExcelPackage $input_excel -Autosize -PassThru -WorksheetName "Load Balancing")
+    }
+}
+
 # Outputs all the results into a Result spreadsheet for easy viewing
 function Print-Results
 {
     $results = Parse-ConnectivityResults
     $results = Parse-DNSResults $results
-    Export-Excel -ExcelPackage $results -Show
+    $results = Parse-LoadBalancingResults $results
+    Close-ExcelPackage -ExcelPackage $results -Show
 }
 
 # Load Lam's OVF props functions
@@ -1329,10 +1365,10 @@ function Prepare-ComponentAppliances
 Parse-PrereqComponents
 Parse-ConnectivityPrereqs
 Check-DNSPrereqs
-#$vms = Create-ComponentAppliances
-#Prepare-ComponentAppliances
-#Check-ComponentConnectivity
-#Print-Results
+$vms = Create-ComponentAppliances
+Prepare-ComponentAppliances
+Check-ComponentConnectivity
+Print-Results
 if ($vms.Count -gt 0 -and $ClearOnExit)
 {
     $vi_server = Connect-VIServer -Server $VsphereFQDN -Credential $VsphereCredentials
