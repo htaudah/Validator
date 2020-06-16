@@ -29,18 +29,28 @@ the results have been generated.
 The number of seconds to wait for an SSH connection to be established before the attempt is aborted
 .PARAMETER ConnectionAttempts
 The number of times to attempt an SSH connection to each appliance
+.PARAMETER DontShowResults
+If specified, the results Excel file will not be automatically opened after saving
+.PARAMETER ProxyServer
+The URL (e.g. 'https://192.168.1.100:9090') of the Proxy server used by components to reach the internet
+.PARAMETER ProxyDenialString
+A string returned in the ProxyServer's HTML response indicating the request was rejected
 #>
 param(
     [string]$SSH_USERNAME="root",
     [string]$SSH_PASSWORD="vmbox",
     [string]$SheetPath=".\Pre-Install_Requirements.xlsx",
+    [ValidateLength(1,100)]
     [string]$OutputPath="",
-    [string]$SelfSignedThumbprint="56BBF846B4D80BE94D8EBD200A20426E7435FA17",
+    [string]$SelfSignedThumbprint="A5A335F2B4AE113CC7BC994960772C0D0F845336",
     [string]$VsphereFQDN="vsphere.haramco.xyz",
     [int]$ConnectionTimeout=5,
     [PSCredential]$VsphereCredentials,
     [switch]$ClearOnExit=$false,
-    [int]$ConnectionAttempts=4
+    [int]$ConnectionAttempts=4,
+    [switch]$DontShowResults=$false,
+    [string]$ProxyServer,
+    [string]$ProxyDenialString
 )
 
 $SECURE_SSH_PASSWORD = ConvertTo-SecureString -String $SSH_PASSWORD -AsPlainText -Force
@@ -932,7 +942,7 @@ function Check-ConnectionBetween([string]$source, $destination, [int]$port, [str
             }
             else
             {
-                $result = Test-Connection -ComputerName $destination -TCPPort $port
+                $result = Test-Connection -ComputerName $destination -TCPPort $port -ErrorAction Ignore
             }
             if ($result)
             {
@@ -1165,7 +1175,18 @@ function Print-Results
     $results = Parse-ConnectivityResults
     $results = Parse-DNSResults $results
     $results = Parse-LoadBalancingResults $results
-    Close-ExcelPackage -ExcelPackage $results -Show
+    $CloseParams = @{
+        ExcelPackage = $results
+    }
+    if (-Not $DontShowResults)
+    {
+        $CloseParams.Add("Show", $true)
+    }
+    if ($OutputPath)
+    {
+        $CloseParams.Add("SaveAs", $OutputPath)
+    }
+    Close-ExcelPackage @CloseParams
 }
 
 # Load Lam's OVF props functions
