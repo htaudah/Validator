@@ -162,8 +162,6 @@ cat ${SCRIPTPATH}/load_ovfprops.sh | sudo tee -a ${PREFIX}/opt/bootlocal.sh > /d
 # Copy any script files that need to be part of the appliance
 # TODO: maybe make this more maintanable?
 sudo mkdir -p ${PREFIX}/opt/validator
-sudo cp -f ${SCRIPTPATH}/check_certificate.sh ${PREFIX}/opt/validator/
-sudo cp -f ${SCRIPTPATH}/check_connection.sh ${PREFIX}/opt/validator/
 
 find | sudo cpio -o -H newc | gzip -2 > /tmp/prepare/tinycore.gz
 sudo cp -f -p /tmp/prepare/tinycore.gz /tmp/prepare/disk/tce/boot/core.gz
