@@ -935,6 +935,11 @@ function Check-ConnectionBetween([string]$source, $destination, [int]$port, [str
         }
         else
         {
+            # Google ports 5228-5230 can't be checked
+            if ($port -match "^52(2[8-9]|30)$" -and $destination -match "google|android|gvt\d|ggpht")
+            {
+                continue
+            }
             # Test-NetConnection was removed in PowerShell Core
             if (-Not $powershell_core)
             {
@@ -1088,9 +1093,9 @@ function Parse-ConnectivityResults($input_excel)
             Protocol = $result[3]
             Result = $result[5]
         }
-        # Google ports 5228-5230 can't be checked
-        # TODO: restrict this exclusion to only google websites?
-        if ($result_object.Port -match "^52(2[8-9]|30)$")
+        # If a test was skipped for any reason, the result is assumed meaningless
+        # TODO: should this be removed?
+        if ($result_object.Result -match "SKIPPED")
         {
             continue
         }
